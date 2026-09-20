@@ -2284,6 +2284,16 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     return true;
 }
 
+// Size of one leg of the pairwise exchange, in bytes. GGML_RPC_COMM_CHUNK_KB overrides it
+// without a rebuild.
+static size_t comm_chunk_size_init() {
+    const char * s = std::getenv("GGML_RPC_COMM_CHUNK_KB");
+    const long   kb = s != nullptr ? std::strtol(s, nullptr, 10) : 0;
+    return kb > 0 ? (size_t) kb * 1024 : 1024 * 1024;
+}
+
+static const size_t comm_chunk_size = comm_chunk_size_init();
+
 // Reduces this rank's contribution in place, exchanging partials with the peer over peers[0].
 // Used when the backend provides no communicator. comm_ctx_v is the comm_state.
 bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors) {
@@ -2357,8 +2367,27 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
         ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
     }
 
-    // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
-    if (state.rank == 0) {
+    // Exchange large payloads in chunks, with both ranks sending before receiving
+    // so transmission can overlap in both directions. Exchanging whole payloads
+    // in rank order leaves one direction idle during each transfer phase.
+    // With TCP, both sends can block waiting for the peer to read, causing a
+    // deadlock. Smaller chunks reduce this risk but do not guarantee safety
+    // across socket configurations.
+    // Buffered Linux RDMA is limited by preposted receive slots instead of TCP
+    // buffers. Each exchange chunk needs ceil(chunk_bytes / RDMA_CHUNK) slots.
+    // Both senders can stall if they exhaust the peer's slots before receiving
+    // and reposting them. Currently, 24 slots of 256 KiB hold up to 6 MiB.
+    // Payloads that fit in one chunk keep the rank-ordered exchange; the potential
+    // benefit from overlapping transmission is limited at small sizes.
+    if (wire_bytes > comm_chunk_size) {
+        for (size_t off = 0; off < wire_bytes; off += comm_chunk_size) {
+            const size_t n = std::min(comm_chunk_size, wire_bytes - off);
+            if (!state.peers[0]->send_data(state.send_buf.data() + off, n) || !state.peers[0]->flush() ||
+                !state.peers[0]->recv_data(state.recv_buf.data() + off, n)) {
+                return false;
+            }
+        }
+    } else if (state.rank == 0) {
         if (!state.peers[0]->send_data(state.send_buf.data(), wire_bytes) || !state.peers[0]->flush() ||
             !state.peers[0]->recv_data(state.recv_buf.data(), wire_bytes)) {
             return false;
