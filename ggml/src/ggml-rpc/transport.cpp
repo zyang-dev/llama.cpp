@@ -54,6 +54,7 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
 static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+static constexpr int    RDMA_TX_DEPTH = 4;             // send ring: 4 x 256 KiB = 1 MiB, 7 MiB with the above
 
 struct rdma_conn {
     struct ibv_context * ctx = nullptr;
@@ -62,14 +63,19 @@ struct rdma_conn {
     struct ibv_cq * rcq = nullptr;   // recv completions
     struct ibv_qp * qp  = nullptr;
 
-    void          * tx_buf = nullptr;
+    void          * tx_buf = nullptr; // RDMA_TX_DEPTH × RDMA_CHUNK contiguous
     struct ibv_mr * tx_mr  = nullptr;
+    int             tx_head = 0;
 
     void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
     struct ibv_mr * rx_mr  = nullptr;
     int             rx_head = 0;
 
     uint32_t        max_inline = 0;
+
+    uint8_t * tx_slot(int i) const {
+        return static_cast<uint8_t *>(tx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
+    }
 
     uint8_t * rx_slot(int i) const {
         return static_cast<uint8_t *>(rx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
@@ -291,7 +297,7 @@ bool socket_t::impl::rdma_probe() {
     rdma->pd = ibv_alloc_pd(ibctx);
     if (!rdma->pd) return false;
 
-    rdma->scq = ibv_create_cq(ibctx, 16, nullptr, nullptr, 0);
+    rdma->scq = ibv_create_cq(ibctx, RDMA_TX_DEPTH + 4, nullptr, nullptr, 0);
     rdma->rcq = ibv_create_cq(ibctx, RDMA_RX_DEPTH + 4, nullptr, nullptr, 0);
     if (!rdma->scq || !rdma->rcq) return false;
 
@@ -299,7 +305,7 @@ bool socket_t::impl::rdma_probe() {
     qia.send_cq = rdma->scq;
     qia.recv_cq = rdma->rcq;
     qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr     = 4;
+    qia.cap.max_send_wr     = RDMA_TX_DEPTH + 4;
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
@@ -309,11 +315,12 @@ bool socket_t::impl::rdma_probe() {
     if (!rdma->qp) return false;
     rdma->max_inline = qia.cap.max_inline_data;
 
-    rdma->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
+    rdma->tx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK);
     rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
     if (!rdma->tx_buf || !rdma->rx_buf) return false;
 
-    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
+    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK,
+                           IBV_ACCESS_LOCAL_WRITE);
     rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!rdma->tx_mr || !rdma->rx_mr) return false;
@@ -418,37 +425,60 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
     }
 }
 
+// Sends in RDMA_CHUNK pieces, keeping up to RDMA_TX_DEPTH of them posted at once. Each chunk
+// costs a round trip to complete, so posting one and waiting for it before posting the next
+// pays that latency once per chunk with nothing on the wire in between.
 bool socket_t::impl::rdma_send(const void * data, size_t size) {
     rdma_conn * c = rdma.get();
     const uint8_t * src = (const uint8_t *)data;
     size_t rem = size;
+    int inflight = 0;
+
     while (rem > 0) {
         size_t chunk = std::min(rem, RDMA_CHUNK);
+
+        // The ring is full, so reclaim the oldest slot before writing into the next one.
+        if (inflight == RDMA_TX_DEPTH) {
+            struct ibv_wc wc;
+            if (!rdma_poll(c->scq, &wc)) return false;
+            inflight--;
+        }
+
+        const int slot = c->tx_head;
+        c->tx_head = (c->tx_head + 1) % RDMA_TX_DEPTH;
 
         struct ibv_sge sge = {};
         struct ibv_send_wr wr = {}, * bad = nullptr;
         wr.opcode  = IBV_WR_SEND;
         wr.sg_list = &sge;
         wr.num_sge = 1;
+        wr.wr_id   = (uint64_t) slot;
 
         if (chunk <= c->max_inline) {
             sge.addr   = (uintptr_t)src;
             sge.length = chunk;
             wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
         } else {
-            memcpy(c->tx_buf, src, chunk);
-            sge.addr   = (uintptr_t)c->tx_buf;
+            memcpy(c->tx_slot(slot), src, chunk);
+            sge.addr   = (uintptr_t)c->tx_slot(slot);
             sge.length = chunk;
             sge.lkey   = c->tx_mr->lkey;
             wr.send_flags = IBV_SEND_SIGNALED;
         }
 
         if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
-        struct ibv_wc wc;
-        if (!rdma_poll(c->scq, &wc)) return false;
+        inflight++;
 
         src += chunk;
         rem -= chunk;
+    }
+
+    // Drain before returning. The caller is free to reuse data once send_data returns, and a
+    // failed completion has to be reported by the call that caused it.
+    while (inflight > 0) {
+        struct ibv_wc wc;
+        if (!rdma_poll(c->scq, &wc)) return false;
+        inflight--;
     }
     return true;
 }
