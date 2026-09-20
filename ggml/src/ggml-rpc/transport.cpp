@@ -17,6 +17,7 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -94,11 +95,11 @@ struct rdma_conn {
     }
 
     ~rdma_conn() {
+        if (qp)  ibv_destroy_qp(qp);
         if (tx_mr) ibv_dereg_mr(tx_mr);
         if (rx_mr) ibv_dereg_mr(rx_mr);
         free(tx_buf);
         free(rx_buf);
-        if (qp)  ibv_destroy_qp(qp);
         if (scq) ibv_destroy_cq(scq);
         if (rcq) ibv_destroy_cq(rcq);
         if (pd)  ibv_dealloc_pd(pd);
@@ -127,6 +128,20 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 
 #endif // GGML_RPC_RDMA && !GGML_RPC_RDMA_APPLE
 
+struct rpc_registered_buffers {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    std::shared_ptr<rdma_conn> conn;
+    ibv_mr * send = nullptr;
+    ibv_mr * recv = nullptr;
+    size_t size = 0;
+
+    ~rpc_registered_buffers() {
+        if (send) ibv_dereg_mr(send);
+        if (recv) ibv_dereg_mr(recv);
+    }
+#endif
+};
+
 struct socket_t::impl {
     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
     ~impl();
@@ -149,7 +164,7 @@ struct socket_t::impl {
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
     bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc);
 
-    std::unique_ptr<rdma_conn> rdma;
+    std::shared_ptr<rdma_conn> rdma;
     rdma_local_info            rdma_local = {};
 #  endif
 #endif // GGML_RPC_RDMA
@@ -291,7 +306,7 @@ bool socket_t::impl::rdma_probe() {
     rdma_local.ib_port = ib_port;
     rdma_local.gid_idx = gid_idx;
 
-    rdma = std::make_unique<rdma_conn>();
+    rdma = std::make_shared<rdma_conn>();
     rdma->ctx = ibctx;
 
     rdma->pd = ibv_alloc_pd(ibctx);
@@ -640,6 +655,133 @@ bool socket_t::recv_data(void * data, size_t size) {
 
 bool socket_t::flush() {
     return pimpl->flush();
+}
+
+bool socket_t::supports_registered_exchange() const {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    return pimpl->use_rdma && pimpl->rdma && pimpl->rdma->qp;
+#else
+    return false;
+#endif
+}
+
+std::shared_ptr<rpc_registered_buffers> socket_t::register_buffers(void * send, void * recv, size_t size) {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    if (!supports_registered_exchange() || !send || !recv || size == 0) {
+        return nullptr;
+    }
+    auto buffers = std::make_shared<rpc_registered_buffers>();
+    buffers->conn = pimpl->rdma;
+    buffers->size = size;
+    buffers->send = ibv_reg_mr(buffers->conn->pd, send, size, IBV_ACCESS_LOCAL_WRITE);
+    if (buffers->send) {
+        buffers->recv = ibv_reg_mr(buffers->conn->pd, recv, size,
+                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    }
+    if (!buffers->send || !buffers->recv) {
+        GGML_LOG_WARN("RDMA direct: could not register %zu bytes per buffer: %s; using buffered exchange\n",
+                      size, strerror(errno));
+        return nullptr;
+    }
+    return buffers;
+#else
+    (void) send;
+    (void) recv;
+    (void) size;
+    return nullptr;
+#endif
+}
+
+bool socket_t::exchange_registered(const std::shared_ptr<rpc_registered_buffers> & buffers,
+                                   size_t size, bool & exchanged) {
+    exchanged = false;
+    auto fail = [&]() {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+        // The peer may start writing as soon as it receives our descriptor.
+        if (pimpl->rdma && pimpl->rdma->qp) {
+            ibv_destroy_qp(pimpl->rdma->qp);
+            pimpl->rdma->qp = nullptr;
+        }
+#endif
+        return false;
+    };
+    // The descriptor is also a readiness barrier: the previous upload is complete, and this
+    // receive buffer will stay registered until the peer's completion marker arrives.
+    struct descriptor {
+        uint64_t addr;
+        uint64_t size;
+        uint32_t rkey;
+        uint32_t magic;
+    } local = { 0, size, 0, 0x47475244 }, remote = {};
+    static_assert(sizeof(descriptor) == 24, "unexpected RDMA descriptor layout");
+
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    if (buffers && supports_registered_exchange() && buffers->conn == pimpl->rdma && size <= buffers->size) {
+        local.addr = (uintptr_t) buffers->recv->addr;
+        local.rkey = buffers->recv->rkey;
+    }
+#else
+    (void) buffers;
+#endif
+
+    if (!send_data(&local, sizeof(local)) || !flush() || !recv_data(&remote, sizeof(remote))) {
+        return fail();
+    }
+    if (remote.magic != local.magic || remote.size != size || remote.addr > UINT64_MAX - size) {
+        GGML_LOG_ERROR("RDMA direct: incompatible exchange descriptor\n");
+        return fail();
+    }
+    if (!local.addr || !remote.addr) {
+        return true;
+    }
+
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    auto * c = buffers->conn.get();
+    auto wait_send = [&]() {
+        ibv_wc wc;
+        return pimpl->rdma_poll(c->scq, &wc);
+    };
+
+    int inflight = 0;
+    for (size_t offset = 0; offset < size;) {
+        if (inflight == RDMA_TX_DEPTH) {
+            if (!wait_send()) return fail();
+            --inflight;
+        }
+        const size_t chunk = std::min(size - offset, RDMA_CHUNK);
+        ibv_sge sge = {};
+        sge.addr   = (uintptr_t) buffers->send->addr + offset;
+        sge.length = chunk;
+        sge.lkey   = buffers->send->lkey;
+        ibv_send_wr wr = {}, * bad = nullptr;
+        wr.opcode = IBV_WR_RDMA_WRITE;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = remote.addr + offset;
+        wr.wr.rdma.rkey = remote.rkey;
+        if (ibv_post_send(c->qp, &wr, &bad) != 0) return fail();
+        ++inflight;
+        offset += chunk;
+    }
+    while (inflight > 0) {
+        if (!wait_send()) return fail();
+        --inflight;
+    }
+
+    // RC orders this SEND after the writes. Its receive completion makes the peer's writes
+    // visible before the caller starts the GPU upload. RDMA writes consume no receive slots.
+    const uint8_t done = 1;
+    uint8_t peer_done = 0;
+    if (!send_data(&done, sizeof(done)) || !flush() ||
+        !recv_data(&peer_done, sizeof(peer_done)) || peer_done != done) {
+        return fail();
+    }
+    exchanged = true;
+    return true;
+#else
+    return false;
+#endif
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {

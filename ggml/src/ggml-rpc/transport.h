@@ -5,6 +5,7 @@
 #include <memory>
 
 struct socket_t;
+struct rpc_registered_buffers;
 typedef std::shared_ptr<socket_t> socket_ptr;
 
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
@@ -19,6 +20,12 @@ struct socket_t {
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
     bool flush();
+
+    bool supports_registered_exchange() const;
+    // Buffers must remain allocated until the registration is released.
+    std::shared_ptr<rpc_registered_buffers> register_buffers(void * send, void * recv, size_t size);
+    // Both peers must call this. A null registration negotiates the buffered fallback.
+    bool exchange_registered(const std::shared_ptr<rpc_registered_buffers> & buffers, size_t size, bool & exchanged);
 
     socket_ptr accept();
 

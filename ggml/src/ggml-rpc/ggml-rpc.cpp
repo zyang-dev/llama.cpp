@@ -1347,6 +1347,12 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
+        bool                    direct_exchange = false;
+        size_t                  direct_capacity = 0;
+        ggml_backend_buffer_ptr direct_send;
+        ggml_backend_buffer_ptr direct_recv;
+        // Release the registrations before freeing their backing buffers.
+        std::shared_ptr<rpc_registered_buffers> direct_registration;
 
         // The backend's communicator. Null on the pairwise path, which has none.
         void *                              backend_comm_ctx = nullptr;
@@ -2126,6 +2132,7 @@ void rpc_server::comm_free_device(uint32_t dev_id) {
             comm_free(state.backend_comm_ctx);
         }
     }
+    state.direct_registration.reset();
     state = comm_state();
 }
 
@@ -2216,6 +2223,12 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
 
     uint8_t use_backend_communicator = 0;
     uint8_t id[GGML_BACKEND_COMM_UNIQUE_ID_SIZE] = {};
+    const char * direct = std::getenv("GGML_RPC_COMM_DIRECT");
+    const bool want_direct = request.world == 2 && direct != nullptr && std::strcmp(direct, "1") == 0 &&
+                             state.peers[0]->supports_registered_exchange();
+    // The ID is unused on the pairwise path. An opt-in marker requests the direct protocol
+    // from an updated peer; with the option off, initialization stays unchanged.
+    const uint8_t direct_magic[] = { 'G', 'G', 'M', 'L', 'R', 'D', 'M', 'A' };
 
     // The ranks must agree on backend communicator or pairwise. Each peer reports whether its
     // backend provides ggml_backend_comm_init_rank, and rank 0 sends back the decision and the
@@ -2233,6 +2246,10 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         if (use_backend_communicator && !get_unique_id(id)) {
             use_backend_communicator = 0;
         }
+        if (!use_backend_communicator) {
+            std::memset(id, 0, sizeof(id));
+            if (want_direct) std::memcpy(id, direct_magic, sizeof(direct_magic));
+        }
         for (const socket_ptr & peer : state.peers) {
             if (!peer->send_data(&use_backend_communicator, sizeof(use_backend_communicator)) ||
                 !peer->send_data(id, sizeof(id)) || !peer->flush()) {
@@ -2248,6 +2265,20 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             state.peers.clear();
             return true;
         }
+    }
+
+    if (!use_backend_communicator && std::memcmp(id, direct_magic, sizeof(direct_magic)) == 0) {
+        uint8_t accepted = want_direct;
+        if (request.rank == 0) {
+            if (!state.peers[0]->recv_data(&accepted, sizeof(accepted))) {
+                state.peers.clear();
+                return true;
+            }
+        } else if (!state.peers[0]->send_data(&accepted, sizeof(accepted)) || !state.peers[0]->flush()) {
+            state.peers.clear();
+            return true;
+        }
+        state.direct_exchange = accepted == 1;
     }
 
     if (use_backend_communicator) {
@@ -2280,6 +2311,9 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     state.pairwise_backend = backends[dev_id];
     state.allreduce_fn     = comm_allreduce_pairwise;
     GGML_LOG_INFO("[%s] device %u using pairwise communicator, rank %u\n", __func__, dev_id, request.rank);
+    if (state.direct_exchange) {
+        GGML_LOG_INFO("[%s] direct RDMA host-buffer exchange enabled for large tensors\n", __func__);
+    }
     response.ok = 1;
     return true;
 }
@@ -2323,9 +2357,47 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
         state.scratch.reset(ggml_backend_alloc_buffer(backend, need));
         state.scratch_size = need;
     }
+    const bool try_direct = state.direct_exchange && wire_bf16;
+    if (try_direct && wire_bytes > state.direct_capacity) {
+        state.direct_registration.reset();
+        state.direct_send.reset();
+        state.direct_recv.reset();
+        state.direct_capacity = wire_bytes;
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+        if (host_buft && state.peers[0]->supports_registered_exchange()) {
+            state.direct_send.reset(ggml_backend_buft_alloc_buffer(host_buft, wire_bytes));
+            state.direct_recv.reset(ggml_backend_buft_alloc_buffer(host_buft, wire_bytes));
+            // CUDA's host allocator can fall back to pageable CPU memory. Keep that case on
+            // the old path so the direct experiment always uses backend-pinned host buffers.
+            if (state.direct_send && state.direct_recv &&
+                ggml_backend_buffer_get_type(state.direct_send.get()) == host_buft &&
+                ggml_backend_buffer_get_type(state.direct_recv.get()) == host_buft) {
+                state.direct_registration = state.peers[0]->register_buffers(
+                    ggml_backend_buffer_get_base(state.direct_send.get()),
+                    ggml_backend_buffer_get_base(state.direct_recv.get()), wire_bytes);
+            }
+        }
+        if (state.direct_registration) {
+            GGML_LOG_INFO("RPC pairwise: registered %.2f MiB send/receive host buffers for direct RDMA\n",
+                          double(wire_bytes) / 1048576.0);
+        } else {
+            state.direct_send.reset();
+            state.direct_recv.reset();
+            GGML_LOG_WARN("RPC pairwise: direct buffers unavailable; negotiating buffered exchange\n");
+        }
+    }
     char * scratch_base = (char *) ggml_backend_buffer_get_base(state.scratch.get());
-    state.send_buf.resize(wire_bytes);
-    state.recv_buf.resize(wire_bytes);
+    void * send_data;
+    void * recv_data;
+    if (try_direct && state.direct_registration) {
+        send_data = ggml_backend_buffer_get_base(state.direct_send.get());
+        recv_data = ggml_backend_buffer_get_base(state.direct_recv.get());
+    } else {
+        state.send_buf.resize(wire_bytes);
+        state.recv_buf.resize(wire_bytes);
+        send_data = state.send_buf.data();
+        recv_data = state.recv_buf.data();
+    }
 
     auto new_scratch_tensor = [&](ggml_type type, size_t offset) {
         ggml_tensor * t = ggml_new_tensor_4d(ctx, type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
@@ -2362,9 +2434,16 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
         t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, ne*2);
         compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
         ggml_backend_synchronize(backend);
-        ggml_backend_tensor_get(t_wire_send, state.send_buf.data(), 0, wire_bytes);
+        ggml_backend_tensor_get(t_wire_send, send_data, 0, wire_bytes);
     } else {
-        ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
+        ggml_backend_tensor_get(t_dst, send_data, 0, wire_bytes);
+    }
+
+    bool exchanged = false;
+    if (try_direct) {
+        if (!state.peers[0]->exchange_registered(state.direct_registration, wire_bytes, exchanged)) {
+            return false;
+        }
     }
 
     // Exchange large payloads in chunks, with both ranks sending before receiving
@@ -2377,24 +2456,26 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
     // buffers. Each exchange chunk needs ceil(chunk_bytes / RDMA_CHUNK) slots.
     // Both senders can stall if they exhaust the peer's slots before receiving
     // and reposting them. Currently, 24 slots of 256 KiB hold up to 6 MiB.
+    // Direct RDMA writes bypass this loop and do not consume receive slots for
+    // the payload; only their small control messages use receive slots.
     // Payloads that fit in one chunk keep the rank-ordered exchange; the potential
     // benefit from overlapping transmission is limited at small sizes.
-    if (wire_bytes > comm_chunk_size) {
+    if (!exchanged && wire_bytes > comm_chunk_size) {
         for (size_t off = 0; off < wire_bytes; off += comm_chunk_size) {
             const size_t n = std::min(comm_chunk_size, wire_bytes - off);
-            if (!state.peers[0]->send_data(state.send_buf.data() + off, n) || !state.peers[0]->flush() ||
-                !state.peers[0]->recv_data(state.recv_buf.data() + off, n)) {
+            if (!state.peers[0]->send_data(static_cast<const uint8_t *>(send_data) + off, n) || !state.peers[0]->flush() ||
+                !state.peers[0]->recv_data(static_cast<uint8_t *>(recv_data) + off, n)) {
                 return false;
             }
         }
-    } else if (state.rank == 0) {
-        if (!state.peers[0]->send_data(state.send_buf.data(), wire_bytes) || !state.peers[0]->flush() ||
-            !state.peers[0]->recv_data(state.recv_buf.data(), wire_bytes)) {
+    } else if (!exchanged && state.rank == 0) {
+        if (!state.peers[0]->send_data(send_data, wire_bytes) || !state.peers[0]->flush() ||
+            !state.peers[0]->recv_data(recv_data, wire_bytes)) {
             return false;
         }
-    } else {
-        if (!state.peers[0]->recv_data(state.recv_buf.data(), wire_bytes) ||
-            !state.peers[0]->send_data(state.send_buf.data(), wire_bytes) || !state.peers[0]->flush()) {
+    } else if (!exchanged) {
+        if (!state.peers[0]->recv_data(recv_data, wire_bytes) ||
+            !state.peers[0]->send_data(send_data, wire_bytes) || !state.peers[0]->flush()) {
             return false;
         }
     }
@@ -2402,10 +2483,10 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
     ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
     ggml_tensor * t_cast = nullptr;
     if (wire_bf16) {
-        ggml_backend_tensor_set(t_wire_recv, state.recv_buf.data(), 0, wire_bytes);
+        ggml_backend_tensor_set(t_wire_recv, recv_data, 0, wire_bytes);
         t_cast = new_cpy_node(t_wire_recv, t_peer);
     } else {
-        ggml_backend_tensor_set(t_peer, state.recv_buf.data(), 0, wire_bytes);
+        ggml_backend_tensor_set(t_peer, recv_data, 0, wire_bytes);
     }
 
     ggml_tensor * t_red = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
